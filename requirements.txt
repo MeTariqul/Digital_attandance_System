@@ -1,0 +1,5 @@
+opencv-python==4.8.0.74
+pandas==2.0.3
+openpyxl==3.1.2
+PyQt5==5.15.9
+cryptography==41.0.3 
