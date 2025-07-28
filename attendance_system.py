@@ -57,17 +57,29 @@ class AttendanceSystem(QMainWindow):
         
         # Smart learning variables
         self.smart_learning_enabled = True
-        self.learning_threshold = 0.8  # Threshold to trigger learning
-        self.recognition_threshold = 0.7  # Threshold for recognition
-        self.max_samples_per_person = 20  # Maximum number of face samples to store per person
+        self.learning_threshold = 0.9  # Higher threshold to trigger more learning
+        self.recognition_threshold = 0.65  # Lower threshold for better recognition
+        self.max_samples_per_person = float('inf')  # Unlimited face samples per person
         self.last_learning_time = {}  # To prevent too frequent updates for the same person
+        
+        # Enhanced face recognition variables
+        self.min_recognition_matches = 2  # Minimum number of face samples that must match for recognition
+        self.match_confidence_threshold = 0.60  # Minimum confidence for a single face match
+        
+        # Attendance confirmation variables
+        self.pending_attendance = None  # Person waiting for attendance confirmation
+        self.confirmation_start_time = None  # When confirmation countdown started
+        self.confirmation_duration = 0  # No waiting time for attendance confirmation
         
         # Face capture variables
         self.capture_mode = False
         self.face_samples = []
         self.sample_count = 0
-        self.required_samples = 5  # Number of angles to capture
+        self.required_samples = 8  # Increased number of angles to capture
         self.current_capture_name = None
+        
+        # Background analysis flag
+        self.process_background = False  # Flag to control background analysis
         
         # Load face detection classifier
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -412,9 +424,21 @@ class AttendanceSystem(QMainWindow):
             self.current_capture_name = name
             self.progress_bar.setValue(0)
             self.progress_bar.setVisible(True)
+            
+            # Update progress bar maximum to match required samples
+            self.progress_bar.setMaximum(self.required_samples)
+            
             QMessageBox.information(self, "Face Capture", 
-                "Please look at the camera and slowly turn your head to capture different angles.\n"
-                "Keep your face within the green rectangle.")
+                f"Please look at the camera and capture {self.required_samples} different angles of your face:\n\n"
+                "1. Look directly at the camera (front view)\n"
+                "2. Slightly turn your head to the left\n"
+                "3. Slightly turn your head to the right\n"
+                "4. Slightly tilt your head up\n"
+                "5. Slightly tilt your head down\n"
+                "6. Slightly tilt your head up and to the left\n"
+                "7. Slightly tilt your head up and to the right\n"
+                "8. Normal expression with different lighting if possible\n\n"
+                "Keep your face within the green rectangle for each capture.")
 
     def update_frame(self):
         ret, frame = self.camera.read()
@@ -422,6 +446,8 @@ class AttendanceSystem(QMainWindow):
             return
         color_frame = frame.copy()  # Keep the color frame for display
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Prioritize face detection before any background analysis
         faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
         
         # Draw a border around the camera feed
@@ -431,6 +457,9 @@ class AttendanceSystem(QMainWindow):
         title_bar_height = 30
         title_bar = np.zeros((title_bar_height, color_frame.shape[1], 3), dtype=np.uint8)
         title_bar[:] = (41, 128, 185)  # Blue color
+        
+        # Only process background if flag is set and we're not in capture mode
+        self.process_background = len(faces) > 0 and not self.capture_mode
         
         if self.capture_mode:
             cv2.putText(title_bar, "CAPTURE MODE", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -478,50 +507,140 @@ class AttendanceSystem(QMainWindow):
             cv2.putText(color_frame, current_time, (color_frame.shape[1]-200, color_frame.shape[0]-20), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
+            # Reset pending attendance if no faces are detected
+            if len(faces) == 0 and self.pending_attendance is not None:
+                current_time = time.time()
+                # Only reset if it's been at least 1 second since confirmation started
+                # This prevents flickering when face detection temporarily fails
+                if self.confirmation_start_time is not None and (current_time - self.confirmation_start_time) > 1.0:
+                    self.pending_attendance = None
+                    self.confirmation_start_time = None
+                    self.status_label.setText("No face detected - confirmation reset")
+                    self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 14px; padding: 5px;")
+                    self.statusBar.showMessage("Attendance confirmation reset - person disappeared from frame")
+            
             for (x, y, w, h) in faces:
                 face_roi = gray[y:y+h, x:x+w]
                 name = "Unknown"
                 best_score = 0
                 best_name = "Unknown"
                 
+                # Enhanced recognition using multiple face data points
+                match_counts = {}  # Count how many samples match for each person
+                match_scores = {}  # Track the average score for each person
+                
                 for known_name, known_faces in self.known_faces.items():
+                    match_counts[known_name] = 0
+                    match_scores[known_name] = 0
+                    match_score_sum = 0
+                    match_count = 0
+                    
                     for known_face in known_faces:
                         try:
                             result = cv2.matchTemplate(face_roi, known_face, cv2.TM_CCOEFF_NORMED)
                             score = cv2.minMaxLoc(result)[1]
+                            
+                            # Count matches above the match confidence threshold
+                            if score > self.match_confidence_threshold:
+                                match_counts[known_name] += 1
+                                match_score_sum += score
+                                match_count += 1
+                                
+                            # Still track the best overall score for display
                             if score > best_score:
                                 best_score = score
                                 best_name = known_name
                         except Exception as e:
                             continue
-                
-                # Set a threshold for recognition
-                if best_score > self.recognition_threshold:
-                    name = best_name
-                    self.mark_attendance(name)
                     
-                    # Update status
-                    self.status_label.setText(f"Recognized: {name} (Score: {best_score:.2f})")
-                    self.status_label.setStyleSheet("color: #2ecc71; font-weight: bold; font-size: 14px; padding: 5px;")
-                    self.statusBar.showMessage(f"Attendance marked for {name} | Score: {best_score:.2f}")
+                    # Calculate average score for this person if there were matches
+                    if match_count > 0:
+                        match_scores[known_name] = match_score_sum / match_count
+                
+                # Find the person with the most matches above threshold
+                most_matches = 0
+                most_matches_name = "Unknown"
+                most_matches_score = 0
+                
+                for person, count in match_counts.items():
+                    if count > most_matches:
+                        most_matches = count
+                        most_matches_name = person
+                        most_matches_score = match_scores[person]
+                
+                # Set a threshold for recognition based on minimum matches
+                if most_matches >= self.min_recognition_matches and most_matches_score > self.recognition_threshold:
+                    name = most_matches_name
+                    # Use the average score for this person
+                    best_score = most_matches_score
+                    current_time = time.time()
+                    
+                    # Handle attendance confirmation process
+                    if self.pending_attendance is None:
+                        # Mark attendance immediately without countdown
+                        self.mark_attendance(name)
+                        self.pending_attendance = name
+                        
+                        # Update status
+                        self.status_label.setText(f"Confirmed & Marked: {name} (Score: {best_score:.2f})")
+                        self.status_label.setStyleSheet("color: #2ecc71; font-weight: bold; font-size: 14px; padding: 5px;")
+                        self.statusBar.showMessage(f"Attendance confirmed and marked for {name} | Score: {best_score:.2f}")
+                    elif self.pending_attendance == name:
+                        # Already marked for this person, just update status
+                        self.status_label.setText(f"Already Marked: {name} (Score: {best_score:.2f})")
+                        self.statusBar.showMessage(f"Attendance already marked for {name} | Score: {best_score:.2f}")
+                    else:
+                        # Different person detected, mark their attendance
+                        self.mark_attendance(name)
+                        self.pending_attendance = name
+                        
+                        # Update status
+                        self.status_label.setText(f"Confirmed & Marked: {name} (Score: {best_score:.2f})")
+                        self.status_label.setStyleSheet("color: #2ecc71; font-weight: bold; font-size: 14px; padding: 5px;")
+                        self.statusBar.showMessage(f"Attendance confirmed and marked for {name} | Score: {best_score:.2f}")
                     
                     # Smart learning - update face data if recognition is successful but score is not very high
                     if self.smart_learning_enabled and best_score < self.learning_threshold:
-                        current_time = time.time()
-                        # Check if we haven't updated this person's data recently (at least 5 seconds ago)
-                        if name not in self.last_learning_time or (current_time - self.last_learning_time[name]) > 5:
+                        # Check if we haven't updated this person's data recently (at least 2 seconds ago)
+                        if name not in self.last_learning_time or (current_time - self.last_learning_time[name]) > 2:
                             self.update_face_data(name, face_roi)
                             self.last_learning_time[name] = current_time
                 else:
                     # Update status for unknown face
                     self.status_label.setText(f"Unknown Face (Best match: {best_name}, Score: {best_score:.2f})")
                     self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 14px; padding: 5px;")
+                    
+                    # If we were in the middle of confirming attendance, reset it
+                    if self.pending_attendance is not None:
+                        self.pending_attendance = None
+                        self.statusBar.showMessage(f"Attendance confirmation reset - recognition lost (score: {best_score:.2f})")
+                        # We don't update status_label here as it's already set to "Unknown Face" above
                 
                 # Draw a more attractive rectangle with color based on recognition status
                 if name != "Unknown":
-                    # Recognized - green
-                    rect_color = (46, 204, 113)  # Green
-                    text_color = (46, 204, 113)  # Green
+                    if self.pending_attendance == name:
+                        # Confirming attendance - yellow/orange
+                        rect_color = (41, 128, 185)  # Blue
+                        text_color = (41, 128, 185)  # Blue
+                        
+                        # Calculate remaining time for confirmation
+                        current_time = time.time()
+                        # Ensure confirmation_start_time is not None before subtraction
+                        if self.confirmation_start_time is not None:
+                            elapsed_time = current_time - self.confirmation_start_time
+                            remaining_time = max(0, self.confirmation_duration - elapsed_time)
+                        else:
+                            # If confirmation_start_time is None, set remaining_time to 0
+                            remaining_time = 0
+                        
+                        # If confirmation is complete, change to green
+                        if remaining_time <= 0:
+                            rect_color = (46, 204, 113)  # Green
+                            text_color = (46, 204, 113)  # Green
+                    else:
+                        # Recognized but not confirming - green
+                        rect_color = (46, 204, 113)  # Green
+                        text_color = (46, 204, 113)  # Green
                 else:
                     # Unknown - red
                     rect_color = (231, 76, 60)  # Red
@@ -532,9 +651,14 @@ class AttendanceSystem(QMainWindow):
                 cv2.rectangle(color_frame, (x, y), (x+w, y+h), rect_color, thickness)
                 
                 # Create a background for the name text
-                text_size = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)[0]
+                display_name = name
+                if self.pending_attendance == name:
+                    # Add confirmation indicator to the name
+                    display_name = f"{name} ✓"
+                
+                text_size = cv2.getTextSize(display_name, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)[0]
                 cv2.rectangle(color_frame, (x, y-30), (x+text_size[0]+10, y), rect_color, -1)
-                cv2.putText(color_frame, name, (x+5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+                cv2.putText(color_frame, display_name, (x+5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
                 
                 # Add confidence score
                 score_text = f"Score: {best_score:.2f}"
@@ -663,17 +787,35 @@ class AttendanceSystem(QMainWindow):
     
     def update_face_data(self, name, new_face_sample):
         if name in self.known_faces:
-            # Add the new face sample to the existing samples
-            if len(self.known_faces[name]) < self.max_samples_per_person:
+            # Check if this sample is sufficiently different from existing samples
+            is_unique = True
+            for existing_sample in self.known_faces[name]:
+                try:
+                    # Compare the new sample with existing ones
+                    result = cv2.matchTemplate(new_face_sample, existing_sample, cv2.TM_CCOEFF_NORMED)
+                    similarity = cv2.minMaxLoc(result)[1]
+                    
+                    # If too similar to an existing sample, don't add it
+                    if similarity > 0.85:  # Slightly lower similarity threshold to capture more variations
+                        is_unique = False
+                        break
+                except Exception as e:
+                    continue
+            
+            # Add the new face sample if it's unique
+            if is_unique:
                 self.known_faces[name].append(new_face_sample)
                 self.save_face_data()
-                print(f"Smart learning: Added new face sample for {name}")
+                print(f"Smart learning: Added new unique face sample for {name}")
+                self.statusBar.showMessage(f"Smart learning: Added new unique face sample for {name} | Total samples: {len(self.known_faces[name])}")
             else:
-                # Replace the oldest sample with the new one
-                self.known_faces[name].pop(0)  # Remove the oldest sample
-                self.known_faces[name].append(new_face_sample)
-                self.save_face_data()
-                print(f"Smart learning: Updated face sample for {name}")
+                print(f"Smart learning: Skipped similar face sample for {name}")
+        else:
+            # If this is a new person, initialize with this sample
+            self.known_faces[name] = [new_face_sample]
+            self.save_face_data()
+            print(f"Smart learning: Created new face profile for {name}")
+            self.statusBar.showMessage(f"Smart learning: Created new face profile for {name}")
     
     def show_about(self):
         # Create a custom about dialog
@@ -701,7 +843,7 @@ class AttendanceSystem(QMainWindow):
         layout.addWidget(title)
         
         # Add subtitle
-        subtitle = QLabel("with Smart Learning Technology")
+        subtitle = QLabel("with Enhanced Recognition & Smart Learning Technology")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setFont(QFont("Arial", 12, QFont.Italic))
         subtitle.setStyleSheet("color: #2ecc71;")
@@ -728,20 +870,58 @@ class AttendanceSystem(QMainWindow):
         feature_frame.setStyleSheet("border: 1px solid #3498db; border-radius: 5px; padding: 10px;")
         feature_layout = QVBoxLayout(feature_frame)
         
-        feature_title = QLabel("Smart Learning Feature:")
+        feature_title = QLabel("Key Features:")
         feature_title.setFont(QFont("Arial", 12, QFont.Bold))
         feature_title.setStyleSheet("color: #f39c12;")
         feature_layout.addWidget(feature_title)
         
-        features = QLabel(
+        # Enhanced Recognition Features
+        enhanced_title = QLabel("Enhanced Face Recognition:")
+        enhanced_title.setFont(QFont("Arial", 10, QFont.Bold))
+        enhanced_title.setStyleSheet("color: #9b59b6; margin-left: 10px;")
+        feature_layout.addWidget(enhanced_title)
+        
+        enhanced_features = QLabel(
+            f"• Uses multiple face data points (minimum {self.min_recognition_matches} matches required)\n"
+            "• Prioritizes face capture before background analysis\n"
+            "• Captures 8 different face angles for better recognition\n"
+            "• Ensures unique face samples for diverse recognition capability"
+        )
+        enhanced_features.setFont(QFont("Arial", 10))
+        enhanced_features.setStyleSheet("margin-left: 20px;")
+        feature_layout.addWidget(enhanced_features)
+        
+        # Smart Learning Features
+        smart_learning_title = QLabel("Smart Learning:")
+        smart_learning_title.setFont(QFont("Arial", 10, QFont.Bold))
+        smart_learning_title.setStyleSheet("color: #2ecc71; margin-left: 10px;")
+        feature_layout.addWidget(smart_learning_title)
+        
+        smart_features = QLabel(
             "• Continuously improves face recognition accuracy\n"
             "• Adapts to gradual changes in appearance\n"
-            "• Maintains up to 20 face samples per person\n"
+            "• Stores unlimited face samples per person for maximum accuracy\n"
             "• Automatically updates face data during recognition"
         )
-        features.setFont(QFont("Arial", 10))
-        features.setStyleSheet("margin-left: 20px;")
-        feature_layout.addWidget(features)
+        smart_features.setFont(QFont("Arial", 10))
+        smart_features.setStyleSheet("margin-left: 20px;")
+        feature_layout.addWidget(smart_features)
+        
+        # Attendance Confirmation Features
+        confirmation_title = QLabel("Attendance Confirmation:")
+        confirmation_title.setFont(QFont("Arial", 10, QFont.Bold))
+        confirmation_title.setStyleSheet("color: #3498db; margin-left: 10px; margin-top: 10px;")
+        feature_layout.addWidget(confirmation_title)
+        
+        confirmation_features = QLabel(
+            "• Instant attendance marking upon recognition\n"
+            "• Prevents duplicate attendance entries\n"
+            "• Visual checkmark confirmation\n"
+            "• Color-coded status indicators"
+        )
+        confirmation_features.setFont(QFont("Arial", 10))
+        confirmation_features.setStyleSheet("margin-left: 20px;")
+        feature_layout.addWidget(confirmation_features)
         
         layout.addWidget(feature_frame)
         
